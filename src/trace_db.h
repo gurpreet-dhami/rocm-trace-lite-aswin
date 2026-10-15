@@ -37,7 +37,8 @@ public:
     void record_kernel(const char* name, int device_id, uint64_t queue_id,
                        uint64_t start_ns, uint64_t end_ns,
                        uint64_t correlation_id,
-                       const char* dispatch_info = nullptr);
+                       const char* dispatch_info = nullptr,
+                       uint64_t roctx_id = 0);
 
     // Record a GPU memory copy (device-side)
     void record_copy(int src_device, int dst_device, size_t bytes,
@@ -74,5 +75,64 @@ bool is_trace_ready();
 
 // Global correlation ID counter
 uint64_t next_correlation_id();
+
+// Innermost roctx range active on the calling thread (0 if none)
+uint64_t current_roctx_id();
+
+// ---- Optional callback hooks ----
+// When set, interception code calls these instead of writing to TraceDB.
+// This allows embedding (e.g., RPD tracer) to redirect events without
+// modifying the interception logic.
+//
+// String lifetime: all const char* fields in event records point to
+// thread-local or stack storage. Pointers are valid only for the
+// duration of the callback invocation. Embedders must copy any strings
+// they need to retain.
+//
+// Thread safety: callbacks must be registered before OnLoad fires
+// (i.e., before any HIP/HSA call). Storage uses std::atomic with
+// relaxed ordering for C++ memory model correctness.
+//
+// Callback requirements: callbacks execute on hot paths (completion
+// worker thread for kernel events, application thread for API events).
+// They must be noexcept and non-blocking.
+
+struct ApiEventRecord {
+    const char* name;       // valid only during callback
+    const char* args;       // valid only during callback
+    uint64_t start_ns;
+    uint64_t end_ns;
+    uint64_t correlation_id;
+    int pid;
+    int tid;
+};
+
+struct KernelEventRecord {
+    const char* name;       // valid only during callback
+    int device_id;
+    uint64_t queue_id;
+    uint64_t start_ns;
+    uint64_t end_ns;
+    uint64_t correlation_id;
+    uint16_t wg_x, wg_y, wg_z;
+    uint32_t grid_x, grid_y, grid_z;
+};
+
+using ApiEventCallback = void(*)(const ApiEventRecord& event, void* user_data);
+using KernelEventCallback = void(*)(const KernelEventRecord& event, void* user_data);
+
+void set_api_event_callback(ApiEventCallback cb, void* user_data);
+void set_kernel_event_callback(KernelEventCallback cb, void* user_data);
+
+ApiEventCallback get_api_event_callback();
+KernelEventCallback get_kernel_event_callback();
+void* get_api_event_callback_data();
+void* get_kernel_event_callback_data();
+
+// Trigger shutdown of the HSA intercept (joins worker, drains queue).
+// Idempotent: guarded by atomic flag, second and subsequent calls are
+// no-ops. Exposed so embedders can drain pending events before
+// finalizing their own storage.
+void rtl_trigger_shutdown();
 
 } // namespace trace_db

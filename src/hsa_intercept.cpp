@@ -636,6 +636,92 @@ static hsa_status_t my_hsa_queue_create(
     return HSA_STATUS_SUCCESS;
 }
 
+// ROCm 10+: CLR calls hsa_amd_queue_create (batch descriptor API) instead of
+// hsa_queue_create.  Redirect each descriptor through hsa_amd_queue_intercept_create
+// so the dispatch callback fires.
+#ifdef HSA_AMD_QUEUE_CREATE_DESC_VERSION
+
+// Saved original so we can fall back for non-compute engine types.
+static decltype(AmdExtTable::hsa_amd_queue_create_fn) g_orig_amd_queue_create = nullptr;
+
+static hsa_status_t my_hsa_amd_queue_create(
+    hsa_agent_t agent, hsa_amd_queue_create_desc_t* descs, uint32_t num_descs) {
+
+    if (!descs || num_descs == 0)
+        return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+
+    hsa_status_t first_error = HSA_STATUS_SUCCESS;
+
+    for (uint32_t i = 0; i < num_descs; i++) {
+        auto& d = descs[i];
+        d.queue = nullptr;
+
+        // Only intercept compute (AQL) queues — SDMA/AIE pass through to the
+        // original API (one descriptor at a time).
+        if (d.engine_type != HSA_AMD_QUEUE_ENGINE_COMPUTE || !g_intercept_available) {
+            hsa_status_t st = g_orig_amd_queue_create(agent, &d, 1);
+            if (st != HSA_STATUS_SUCCESS && first_error == HSA_STATUS_SUCCESS)
+                first_error = st;
+            continue;
+        }
+
+        // Extract parameters from the descriptor for hsa_amd_queue_intercept_create.
+        uint32_t queue_size = d.queue_size_bytes / sizeof(hsa_kernel_dispatch_packet_t);
+        if (queue_size == 0) queue_size = 64;
+        hsa_queue_type32_t type = d.engine.compute.type;
+        uint32_t priv_seg = d.engine.compute.private_segment_size;
+        uint32_t safe_priv_seg = (priv_seg == UINT32_MAX) ? 0 : priv_seg;
+
+        hsa_queue_t* queue = nullptr;
+        hsa_status_t st = g_orig_ext.hsa_amd_queue_intercept_create_fn(
+            agent, queue_size, type, d.callback, d.callback_data,
+            safe_priv_seg, 0, &queue);
+
+        if (st != HSA_STATUS_SUCCESS) {
+            // Fallback: create via the original API without intercept.
+            st = g_orig_amd_queue_create(agent, &d, 1);
+            if (st != HSA_STATUS_SUCCESS && first_error == HSA_STATUS_SUCCESS)
+                first_error = st;
+            continue;
+        }
+
+        d.queue = queue;
+
+        // Enable profiling timestamps on this queue.
+        g_orig_ext.hsa_amd_profiling_set_profiler_enabled_fn(queue, true);
+
+        // Apply priority if non-default.
+        if (d.priority != HSA_AMD_QUEUE_PRIORITY_NORMAL &&
+            g_orig_ext.hsa_amd_queue_set_priority_fn != nullptr) {
+            g_orig_ext.hsa_amd_queue_set_priority_fn(queue, d.priority);
+        }
+
+        // Build QueueInfo and register intercept callback (same as my_hsa_queue_create).
+        auto* qi = new QueueInfo;
+        qi->device_id = 0;
+        qi->queue_handle = (uint64_t)queue;
+        qi->hw_queue_addr = queue ? (uint64_t)queue->base_address : 0;
+        {
+            std::lock_guard<std::mutex> lock(g_agent_mutex);
+            for (size_t j = 0; j < g_gpu_agents.size(); j++) {
+                if (g_gpu_agents[j].handle == agent.handle) {
+                    qi->device_id = (int)j;
+                    break;
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_queue_mutex);
+            g_queue_map[(uint64_t)queue] = *qi;
+        }
+        g_orig_ext.hsa_amd_queue_intercept_register_fn(queue, queue_intercept_cb, qi);
+    }
+
+    return first_error;
+}
+
+#endif // HSA_AMD_QUEUE_CREATE_DESC_VERSION
+
 static hsa_status_t my_hsa_executable_freeze(hsa_executable_t executable, const char* options) {
     hsa_status_t status = g_orig_core.hsa_executable_freeze_fn(executable, options);
     if (status == HSA_STATUS_SUCCESS) {
@@ -761,6 +847,16 @@ extern "C" bool OnLoad(void* pTable,
     // Replace queue creation and executable freeze
     table->core_->hsa_queue_create_fn = my_hsa_queue_create;
     table->core_->hsa_executable_freeze_fn = my_hsa_executable_freeze;
+
+    // ROCm 10+: CLR uses hsa_amd_queue_create instead of hsa_queue_create.
+    // Intercept the new API so dispatch profiling works on both old and new CLR.
+#ifdef HSA_AMD_QUEUE_CREATE_DESC_VERSION
+    if (table->amd_ext_->hsa_amd_queue_create_fn != nullptr) {
+        g_orig_amd_queue_create = g_orig_ext.hsa_amd_queue_create_fn;
+        table->amd_ext_->hsa_amd_queue_create_fn = my_hsa_amd_queue_create;
+        fprintf(stderr, "rtl: hsa_amd_queue_create intercepted (ROCm 10+ path)\n");
+    }
+#endif
 
     // Discover GPU agents (immutable after this point)
     hsa_iterate_agents(agent_iterate_cb, nullptr);

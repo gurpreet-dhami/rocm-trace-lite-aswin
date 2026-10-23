@@ -655,38 +655,17 @@ static void shutdown() {
 
 // ---- HSA intercept table callback (replaces OnLoad) ----
 
-static pid_t g_table_setup_pid = 0;
-
 static void hsa_table_callback(rocprofiler_intercept_table_t type,
                                 uint64_t, uint64_t lib_instance,
                                 void** tables, uint64_t num_tables, void*) {
     if (type != ROCPROFILER_HSA_TABLE || num_tables < 1) return;
     if (lib_instance != 0) return;
 
-    // In forked workers, this callback fires again but the parent already set
-    // up the API table wrappers (which the child inherits via fork). Re-running
-    // setup would overwrite g_orig_core/g_orig_ext with rocprofiler-sdk's
-    // wrappers instead of the real HSA functions, breaking the intercept chain.
-    // Detect fork via PID mismatch and only reinit worker infrastructure.
-    if (g_table_setup_pid != 0 && g_table_setup_pid != getpid()) {
-        g_shutdown.store(false, std::memory_order_release);
-        g_central_head.store(0, std::memory_order_relaxed);
-        g_central_tail.store(0, std::memory_order_relaxed);
-        for (size_t i = 0; i < CENTRAL_CAPACITY; i++)
-            g_central_slots[i].sequence.store(i, std::memory_order_relaxed);
-        size_t filled = 0;
-        for (size_t i = 0; i < 64; i++) {
-            hsa_signal_t sig;
-            if (g_orig_core.hsa_signal_create_fn(1, 0, nullptr, &sig) == HSA_STATUS_SUCCESS) {
-                if (central_try_push(sig)) filled++;
-                else { g_orig_core.hsa_signal_destroy_fn(sig); break; }
-            }
-        }
-        g_worker = std::thread(completion_worker);
-        fprintf(stderr, "rtl: forked worker reinit (pid=%d, %zu signals)\n", getpid(), filled);
-        return;
-    }
-    g_table_setup_pid = getpid();
+    // Full setup runs in every process (parent AND forked children).
+    // After fork, rocprofiler-register re-scans and provides a fresh HSA table.
+    // We save the (potentially wrapped) function pointers and install our
+    // wrappers — this chains correctly: our wrapper → rocp wrapper → real HSA.
+    g_shutdown.store(false, std::memory_order_release);
 
     auto* table = static_cast<HsaApiTable*>(tables[0]);
 

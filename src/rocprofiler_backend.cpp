@@ -1,12 +1,11 @@
 /*
- * rocprofiler_backend.cpp — rocprofiler-sdk callback tracing backend
+ * rocprofiler_backend.cpp — rocprofiler-sdk buffer tracing backend
  *
- * Uses rocprofiler-sdk's callback tracing API for kernel dispatch timing.
- * rocprofiler-sdk handles queue intercept internally — captures all kernel
- * dispatches including CUDA graph replays.
+ * Uses rocprofiler-sdk's async buffer tracing API for kernel dispatch timing.
+ * Buffer tracing delivers records on a background thread, avoiding deadlocks
+ * during framework initialization and capturing CUDA graph replay dispatches.
  *
  * Entry point: rocprofiler_configure() — discovered by rocprofiler-register.
- * Works with spawn workers (each process gets independent init).
  *
  * Copyright (c) 2026 Advanced Micro Devices, Inc.
  */
@@ -15,15 +14,19 @@
 
 #include <rocprofiler-sdk/registration.h>
 #include <rocprofiler-sdk/agent.h>
+#include <rocprofiler-sdk/buffer.h>
+#include <rocprofiler-sdk/buffer_tracing.h>
 #include <rocprofiler-sdk/callback_tracing.h>
 #include <rocprofiler-sdk/context.h>
 #include <rocprofiler-sdk/fwd.h>
+#include <rocprofiler-sdk/internal_threading.h>
 
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cxxabi.h>
+#include <inttypes.h>
 #include <mutex>
 #include <string>
 #include <unistd.h>
@@ -31,10 +34,8 @@
 
 namespace {
 
-// ---- Global state ----
-
-rocprofiler_client_finalize_t g_fini_func = nullptr;
-rocprofiler_context_id_t     g_ctx;
+rocprofiler_context_id_t g_ctx;
+rocprofiler_buffer_id_t  g_buffer;
 
 std::unordered_map<uint64_t, int> g_agent_device_map;
 std::mutex                        g_agent_mutex;
@@ -43,16 +44,15 @@ std::unordered_map<uint64_t, std::string> g_kernel_names;
 std::mutex                                g_kernel_mutex;
 
 std::atomic<bool> g_shutdown_done{false};
+std::atomic<uint64_t> g_recorded{0};
 
 // ---- Kernel name demangling ----
 
 std::string demangle_kernel_name(const char* raw) {
     if (!raw || !*raw) return "<unknown>";
     std::string name(raw);
-
     if (name.size() > 3 && name.compare(name.size() - 3, 3, ".kd") == 0)
         name.resize(name.size() - 3);
-
     if (name.size() >= 2 && name[0] == '_' && name[1] == 'Z') {
         int status = 0;
         char* demangled = abi::__cxa_demangle(name.c_str(), nullptr, nullptr, &status);
@@ -60,21 +60,17 @@ std::string demangle_kernel_name(const char* raw) {
             std::string full(demangled);
             free(demangled);
             size_t start = 0;
-            auto first_colon = full.find("::");
-            auto first_space = full.find(' ');
-            if (first_space != std::string::npos && first_colon != std::string::npos
-                && first_space < first_colon)
-                start = first_space + 1;
+            auto fc = full.find("::");
+            auto fs = full.find(' ');
+            if (fs != std::string::npos && fc != std::string::npos && fs < fc)
+                start = fs + 1;
             static constexpr const char* ANON_NS = "(anonymous namespace)";
-            static constexpr size_t ANON_NS_LEN = 21;
-            size_t end = std::string::npos;
-            size_t pos = start;
+            size_t end = std::string::npos, pos = start;
             while (pos < full.size()) {
                 pos = full.find('(', pos);
                 if (pos == std::string::npos) break;
-                if (full.compare(pos, ANON_NS_LEN, ANON_NS) == 0) { pos += ANON_NS_LEN; continue; }
-                end = pos;
-                break;
+                if (full.compare(pos, 21, ANON_NS) == 0) { pos += 21; continue; }
+                end = pos; break;
             }
             if (end == std::string::npos) end = full.size();
             name = full.substr(start, end - start);
@@ -96,59 +92,66 @@ int resolve_device_id(uint64_t agent_handle) {
     return (it != g_agent_device_map.end()) ? it->second : -1;
 }
 
-// ---- Callbacks ----
+// ---- Buffer tracing callback (runs on background thread) ----
 
-void kernel_dispatch_callback(rocprofiler_callback_tracing_record_t record,
-                              rocprofiler_user_data_t*,
-                              void*) {
-    if (record.kind != ROCPROFILER_CALLBACK_TRACING_KERNEL_DISPATCH)
-        return;
+void buffer_tracing_callback(rocprofiler_context_id_t,
+                              rocprofiler_buffer_id_t,
+                              rocprofiler_record_header_t** headers,
+                              size_t                        num_headers,
+                              void*,
+                              uint64_t                      drop_count) {
+    if (drop_count > 0)
+        fprintf(stderr, "rtl: WARNING: %" PRIu64 " records dropped (buffer full)\n", drop_count);
 
-    if (record.operation == ROCPROFILER_KERNEL_DISPATCH_COMPLETE &&
-        record.phase == ROCPROFILER_CALLBACK_PHASE_NONE) {
-        auto* data = static_cast<rocprofiler_callback_tracing_kernel_dispatch_data_t*>(
-            record.payload);
-        if (!data) return;
+    for (size_t i = 0; i < num_headers; ++i) {
+        auto* hdr = headers[i];
+        if (hdr->category == ROCPROFILER_BUFFER_CATEGORY_TRACING &&
+            hdr->kind == ROCPROFILER_BUFFER_TRACING_KERNEL_DISPATCH) {
 
-        const auto& info = data->dispatch_info;
-        int device_id = resolve_device_id(info.agent_id.handle);
-        const std::string& kname = resolve_kernel_name(info.kernel_id);
+            auto* record = static_cast<rocprofiler_buffer_tracing_kernel_dispatch_record_t*>(
+                hdr->payload);
 
-        char dispatch_info[128];
-        snprintf(dispatch_info, sizeof(dispatch_info),
-                 "wg=%u,%u,%u grid=%u,%u,%u",
-                 info.workgroup_size.x, info.workgroup_size.y, info.workgroup_size.z,
-                 info.grid_size.x, info.grid_size.y, info.grid_size.z);
+            const auto& info = record->dispatch_info;
+            int device_id = resolve_device_id(info.agent_id.handle);
+            const std::string& kname = resolve_kernel_name(info.kernel_id);
 
-        trace_db::get_trace_db().record_kernel(
-            kname.c_str(),
-            device_id,
-            info.queue_id.handle,
-            data->start_timestamp,
-            data->end_timestamp,
-            record.correlation_id.internal,
-            dispatch_info,
-            trace_db::current_roctx_id());
+            char dispatch_info[128];
+            snprintf(dispatch_info, sizeof(dispatch_info),
+                     "wg=%u,%u,%u grid=%u,%u,%u",
+                     info.workgroup_size.x, info.workgroup_size.y, info.workgroup_size.z,
+                     info.grid_size.x, info.grid_size.y, info.grid_size.z);
+
+            trace_db::get_trace_db().record_kernel(
+                kname.c_str(),
+                device_id,
+                info.queue_id.handle,
+                record->start_timestamp,
+                record->end_timestamp,
+                record->correlation_id.internal,
+                dispatch_info,
+                0);
+
+            g_recorded.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 }
+
+// ---- Code object callback (synchronous — kernel symbol registration is safe) ----
 
 void code_object_callback(rocprofiler_callback_tracing_record_t record,
                           rocprofiler_user_data_t*,
                           void*) {
-    if (record.kind != ROCPROFILER_CALLBACK_TRACING_CODE_OBJECT)
-        return;
+    if (record.kind != ROCPROFILER_CALLBACK_TRACING_CODE_OBJECT) return;
+    if (record.operation != ROCPROFILER_CODE_OBJECT_DEVICE_KERNEL_SYMBOL_REGISTER) return;
+    if (record.phase != ROCPROFILER_CALLBACK_PHASE_LOAD) return;
 
-    if (record.operation == ROCPROFILER_CODE_OBJECT_DEVICE_KERNEL_SYMBOL_REGISTER &&
-        record.phase == ROCPROFILER_CALLBACK_PHASE_LOAD) {
-        auto* data = static_cast<
-            rocprofiler_callback_tracing_code_object_kernel_symbol_register_data_t*>(
-            record.payload);
-        if (!data || !data->kernel_name) return;
+    auto* data = static_cast<
+        rocprofiler_callback_tracing_code_object_kernel_symbol_register_data_t*>(record.payload);
+    if (!data || !data->kernel_name) return;
 
-        std::string demangled = demangle_kernel_name(data->kernel_name);
-        std::lock_guard<std::mutex> lock(g_kernel_mutex);
-        g_kernel_names[data->kernel_id] = std::move(demangled);
-    }
+    std::string demangled = demangle_kernel_name(data->kernel_name);
+    std::lock_guard<std::mutex> lock(g_kernel_mutex);
+    g_kernel_names[data->kernel_id] = std::move(demangled);
 }
 
 // ---- Agent enumeration ----
@@ -172,23 +175,24 @@ rocprofiler_status_t agent_enumerate_cb(rocprofiler_agent_version_t,
 
 void shutdown() {
     bool expected = false;
-    if (!g_shutdown_done.compare_exchange_strong(expected, true))
-        return;
+    if (!g_shutdown_done.compare_exchange_strong(expected, true)) return;
+
+    rocprofiler_flush_buffer(g_buffer);
+
+    fprintf(stderr, "rtl: recorded %" PRIu64 " kernel dispatches (pid=%d)\n",
+            g_recorded.load(), getpid());
+
     auto& db = trace_db::get_trace_db();
     db.flush();
     db.close();
-    fprintf(stderr, "rtl: rocprofiler-sdk backend shutdown complete\n");
+    fprintf(stderr, "rtl: rocprofiler-sdk backend shutdown complete (pid=%d)\n", getpid());
 }
 
 // ---- Tool init / fini ----
 
-int rtl_tool_init(rocprofiler_client_finalize_t fini_func, void*) {
-    g_fini_func = fini_func;
-
+int rtl_tool_init(rocprofiler_client_finalize_t, void*) {
     const char* output_env = std::getenv("RTL_OUTPUT");
-    std::string db_pattern = output_env ? output_env : "rtl_trace_%p.db";
-
-    std::string db_path = db_pattern;
+    std::string db_path = output_env ? output_env : "rtl_trace_%p.db";
     auto pos = db_path.find("%p");
     if (pos != std::string::npos)
         db_path.replace(pos, 2, std::to_string(getpid()));
@@ -205,20 +209,42 @@ int rtl_tool_init(rocprofiler_client_finalize_t fini_func, void*) {
 
     auto status = rocprofiler_create_context(&g_ctx);
     if (status != ROCPROFILER_STATUS_SUCCESS) {
-        fprintf(stderr, "rtl: ERROR: rocprofiler_create_context failed (%d)\n", status);
+        fprintf(stderr, "rtl: ERROR: create_context failed (%d)\n", status);
         return -1;
     }
 
-    // Register for ALL kernel dispatch operations (enqueue + complete)
-    // to capture graph replay dispatches
-    status = rocprofiler_configure_callback_tracing_service(
-        g_ctx, ROCPROFILER_CALLBACK_TRACING_KERNEL_DISPATCH,
-        nullptr, 0, kernel_dispatch_callback, nullptr);
+    // Create buffer for async kernel dispatch records (8MB, flush at 4MB watermark)
+    status = rocprofiler_create_buffer(
+        g_ctx, 8 * 1024 * 1024, 4 * 1024 * 1024,
+        ROCPROFILER_BUFFER_POLICY_LOSSLESS,
+        buffer_tracing_callback, nullptr, &g_buffer);
     if (status != ROCPROFILER_STATUS_SUCCESS) {
-        fprintf(stderr, "rtl: ERROR: configure kernel dispatch tracing failed (%d)\n", status);
+        fprintf(stderr, "rtl: ERROR: create_buffer failed (%d)\n", status);
         return -1;
     }
 
+    // Create dedicated callback thread for buffer processing
+    rocprofiler_callback_thread_t cb_thread;
+    status = rocprofiler_create_callback_thread(&cb_thread);
+    if (status != ROCPROFILER_STATUS_SUCCESS) {
+        fprintf(stderr, "rtl: ERROR: create_callback_thread failed (%d)\n", status);
+        return -1;
+    }
+    status = rocprofiler_assign_callback_thread(g_buffer, cb_thread);
+    if (status != ROCPROFILER_STATUS_SUCCESS) {
+        fprintf(stderr, "rtl: WARNING: assign_callback_thread failed (%d), using default\n", status);
+    }
+
+    // Register buffer tracing for kernel dispatch
+    status = rocprofiler_configure_buffer_tracing_service(
+        g_ctx, ROCPROFILER_BUFFER_TRACING_KERNEL_DISPATCH,
+        nullptr, 0, g_buffer);
+    if (status != ROCPROFILER_STATUS_SUCCESS) {
+        fprintf(stderr, "rtl: ERROR: configure buffer tracing failed (%d)\n", status);
+        return -1;
+    }
+
+    // Code object callback (synchronous — safe for symbol registration)
     rocprofiler_tracing_operation_t code_ops[] = {
         ROCPROFILER_CODE_OBJECT_DEVICE_KERNEL_SYMBOL_REGISTER
     };
@@ -226,18 +252,17 @@ int rtl_tool_init(rocprofiler_client_finalize_t fini_func, void*) {
         g_ctx, ROCPROFILER_CALLBACK_TRACING_CODE_OBJECT,
         code_ops, 1, code_object_callback, nullptr);
     if (status != ROCPROFILER_STATUS_SUCCESS) {
-        fprintf(stderr, "rtl: ERROR: configure code object tracing failed (%d)\n", status);
-        return -1;
+        fprintf(stderr, "rtl: WARNING: code object tracing failed (%d)\n", status);
     }
 
     status = rocprofiler_start_context(g_ctx);
     if (status != ROCPROFILER_STATUS_SUCCESS) {
-        fprintf(stderr, "rtl: ERROR: rocprofiler_start_context failed (%d)\n", status);
+        fprintf(stderr, "rtl: ERROR: start_context failed (%d)\n", status);
         return -1;
     }
 
     std::atexit(shutdown);
-    fprintf(stderr, "rtl: rocprofiler-sdk callback tracing initialized (pid=%d)\n", getpid());
+    fprintf(stderr, "rtl: buffer tracing initialized (pid=%d)\n", getpid());
     return 0;
 }
 
@@ -247,8 +272,6 @@ void rtl_tool_fini(void*) {
 
 } // anonymous namespace
 
-// ---- rocprofiler entry point ----
-
 extern "C" {
 
 rocprofiler_tool_configure_result_t*
@@ -256,8 +279,7 @@ rocprofiler_configure(uint32_t                 version,
                       const char*              runtime_version,
                       uint32_t                 priority,
                       rocprofiler_client_id_t* client_id) {
-    if (std::getenv("RTL_ROCP_DISABLE"))
-        return nullptr;
+    if (std::getenv("RTL_ROCP_DISABLE")) return nullptr;
 
     client_id->name = "rocm-trace-lite";
 
@@ -280,7 +302,5 @@ rocprofiler_configure(uint32_t                 version,
 } // extern "C"
 
 namespace trace_db {
-void rtl_trigger_shutdown() {
-    shutdown();
-}
+void rtl_trigger_shutdown() { shutdown(); }
 } // namespace trace_db

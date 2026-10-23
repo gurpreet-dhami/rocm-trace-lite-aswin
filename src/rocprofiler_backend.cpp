@@ -46,6 +46,27 @@ std::mutex                                g_kernel_mutex;
 
 std::atomic<bool> g_shutdown_done{false};
 
+// Track the PID that called tool_init — forked children detect PID change
+pid_t g_init_pid = 0;
+std::string g_db_pattern;  // RTL_OUTPUT pattern with %p
+std::atomic<bool> g_fork_db_initialized{false};
+
+void ensure_db_for_this_process() {
+    if (g_init_pid == getpid()) return;
+    bool expected = false;
+    if (!g_fork_db_initialized.compare_exchange_strong(expected, true)) return;
+
+    std::string db_path = g_db_pattern;
+    auto pos = db_path.find("%p");
+    if (pos != std::string::npos) {
+        db_path.replace(pos, 2, std::to_string(getpid()));
+    }
+    if (trace_db::get_trace_db().open(db_path)) {
+        fprintf(stderr, "rtl: forked worker DB opened: %s (pid=%d)\n",
+                db_path.c_str(), getpid());
+    }
+}
+
 // ---- Kernel name demangling (matches hsa_intercept.cpp logic) ----
 
 std::string demangle_kernel_name(const char* raw) {
@@ -116,6 +137,7 @@ void kernel_dispatch_callback(rocprofiler_callback_tracing_record_t record,
 
     if (record.operation == ROCPROFILER_KERNEL_DISPATCH_COMPLETE &&
         record.phase == ROCPROFILER_CALLBACK_PHASE_NONE) {
+        ensure_db_for_this_process();
         auto* data = static_cast<rocprofiler_callback_tracing_kernel_dispatch_data_t*>(
             record.payload);
         if (!data) return;
@@ -199,8 +221,10 @@ int rtl_tool_init(rocprofiler_client_finalize_t fini_func, void*) {
     g_fini_func = fini_func;
 
     const char* output_env = std::getenv("RTL_OUTPUT");
-    std::string db_path = output_env ? output_env : "rtl_trace_%p.db";
+    g_db_pattern = output_env ? output_env : "rtl_trace_%p.db";
+    g_init_pid = getpid();
 
+    std::string db_path = g_db_pattern;
     auto pos = db_path.find("%p");
     if (pos != std::string::npos) {
         db_path.replace(pos, 2, std::to_string(getpid()));

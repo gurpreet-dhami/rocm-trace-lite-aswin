@@ -655,15 +655,43 @@ static void shutdown() {
 
 // ---- HSA intercept table callback (replaces OnLoad) ----
 
+static std::atomic<bool> g_table_setup_done{false};
+
 static void hsa_table_callback(rocprofiler_intercept_table_t type,
                                 uint64_t, uint64_t lib_instance,
                                 void** tables, uint64_t num_tables, void*) {
     if (type != ROCPROFILER_HSA_TABLE || num_tables < 1) return;
     if (lib_instance != 0) return;
 
+    // In forked workers, this callback fires again but the parent already set
+    // up the API table wrappers. The child inherits them — re-running setup
+    // would overwrite g_orig_core/g_orig_ext with rocprofiler-sdk's wrappers
+    // (not the real HSA functions), breaking the call chain.
+    // Only re-initialize the worker thread and signal pool for the new process.
+    if (g_table_setup_done.load(std::memory_order_acquire)) {
+        // Forked child: reinit worker infrastructure only
+        g_shutdown.store(false, std::memory_order_release);
+        g_central_head.store(0, std::memory_order_relaxed);
+        g_central_tail.store(0, std::memory_order_relaxed);
+        for (size_t i = 0; i < CENTRAL_CAPACITY; i++)
+            g_central_slots[i].sequence.store(i, std::memory_order_relaxed);
+        size_t filled = 0;
+        for (size_t i = 0; i < 64; i++) {
+            hsa_signal_t sig;
+            if (g_orig_core.hsa_signal_create_fn(1, 0, nullptr, &sig) == HSA_STATUS_SUCCESS) {
+                if (central_try_push(sig)) filled++;
+                else { g_orig_core.hsa_signal_destroy_fn(sig); break; }
+            }
+        }
+        g_worker = std::thread(completion_worker);
+        fprintf(stderr, "rtl: forked worker reinit (pid=%d, %zu signals)\n", getpid(), filled);
+        return;
+    }
+    g_table_setup_done.store(true, std::memory_order_release);
+
     auto* table = static_cast<HsaApiTable*>(tables[0]);
 
-    // Save original API tables
+    // Save original API tables (real HSA functions, before any wrapping)
     g_orig_core = *table->core_;
     g_orig_ext = *table->amd_ext_;
 

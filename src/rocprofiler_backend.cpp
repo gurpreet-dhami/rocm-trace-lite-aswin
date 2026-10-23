@@ -655,7 +655,7 @@ static void shutdown() {
 
 // ---- HSA intercept table callback (replaces OnLoad) ----
 
-static std::atomic<bool> g_table_setup_done{false};
+static pid_t g_table_setup_pid = 0;
 
 static void hsa_table_callback(rocprofiler_intercept_table_t type,
                                 uint64_t, uint64_t lib_instance,
@@ -664,12 +664,11 @@ static void hsa_table_callback(rocprofiler_intercept_table_t type,
     if (lib_instance != 0) return;
 
     // In forked workers, this callback fires again but the parent already set
-    // up the API table wrappers. The child inherits them — re-running setup
-    // would overwrite g_orig_core/g_orig_ext with rocprofiler-sdk's wrappers
-    // (not the real HSA functions), breaking the call chain.
-    // Only re-initialize the worker thread and signal pool for the new process.
-    if (g_table_setup_done.load(std::memory_order_acquire)) {
-        // Forked child: reinit worker infrastructure only
+    // up the API table wrappers (which the child inherits via fork). Re-running
+    // setup would overwrite g_orig_core/g_orig_ext with rocprofiler-sdk's
+    // wrappers instead of the real HSA functions, breaking the intercept chain.
+    // Detect fork via PID mismatch and only reinit worker infrastructure.
+    if (g_table_setup_pid != 0 && g_table_setup_pid != getpid()) {
         g_shutdown.store(false, std::memory_order_release);
         g_central_head.store(0, std::memory_order_relaxed);
         g_central_tail.store(0, std::memory_order_relaxed);
@@ -687,7 +686,7 @@ static void hsa_table_callback(rocprofiler_intercept_table_t type,
         fprintf(stderr, "rtl: forked worker reinit (pid=%d, %zu signals)\n", getpid(), filled);
         return;
     }
-    g_table_setup_done.store(true, std::memory_order_release);
+    g_table_setup_pid = getpid();
 
     auto* table = static_cast<HsaApiTable*>(tables[0]);
 

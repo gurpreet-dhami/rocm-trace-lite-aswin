@@ -6,6 +6,18 @@ import subprocess
 import sqlite3
 
 
+def _is_rocp_backend(lib_path):
+    """Check if librtl.so was built with the rocprofiler-sdk backend."""
+    try:
+        out = subprocess.run(
+            ["nm", "-D", lib_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, timeout=5
+        )
+        return "rocprofiler_configure" in out.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def _preflight_check(lib_path):
     """Advisory check: verify the profiler library and its dependencies.
 
@@ -128,10 +140,17 @@ def run_trace(args):
     per_process_pattern = os.path.join(trace_dir, f"{trace_base}_%p.db")
 
     env = os.environ.copy()
-    env["HSA_TOOLS_LIB"] = lib
     env["RTL_OUTPUT"] = per_process_pattern
-    # LD_PRELOAD librtl.so so roctx shim symbols are globally visible.
-    # Without this, ctypes.CDLL(None).roctxRangePushA won't find our symbols.
+
+    rocp_backend = _is_rocp_backend(lib)
+    if rocp_backend:
+        print("rtl: using rocprofiler-sdk backend (skipping HSA_TOOLS_LIB)", file=sys.stderr)
+    else:
+        env["HSA_TOOLS_LIB"] = lib
+
+    # LD_PRELOAD librtl.so: for HSA backend provides OnLoad symbol visibility;
+    # for rocprofiler-sdk backend provides rocprofiler_configure symbol visibility
+    # and roctx shim symbols.
     existing_preload = env.get("LD_PRELOAD", "")
     env["LD_PRELOAD"] = "{}:{}".format(lib, existing_preload) if existing_preload else lib
     if hasattr(args, 'mode') and args.mode:

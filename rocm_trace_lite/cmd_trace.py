@@ -144,13 +144,15 @@ def run_trace(args):
 
     rocp_backend = _is_rocp_backend(lib)
     if rocp_backend:
-        print("rtl: using rocprofiler-sdk backend (skipping HSA_TOOLS_LIB)", file=sys.stderr)
+        print("rtl: using rocprofiler-sdk backend", file=sys.stderr)
+        # Register via ROCP_TOOL_LIBRARIES (like rocprofv3 does) — ensures
+        # rocprofiler-register loads our tool before any runtime initializes.
+        existing_rocp = env.get("ROCP_TOOL_LIBRARIES", "")
+        env["ROCP_TOOL_LIBRARIES"] = "{}:{}".format(lib, existing_rocp) if existing_rocp else lib
     else:
         env["HSA_TOOLS_LIB"] = lib
 
-    # LD_PRELOAD librtl.so: for HSA backend provides OnLoad symbol visibility;
-    # for rocprofiler-sdk backend provides rocprofiler_configure symbol visibility
-    # and roctx shim symbols.
+    # LD_PRELOAD librtl.so for roctx shim symbol visibility.
     existing_preload = env.get("LD_PRELOAD", "")
     env["LD_PRELOAD"] = "{}:{}".format(lib, existing_preload) if existing_preload else lib
     if hasattr(args, 'mode') and args.mode:

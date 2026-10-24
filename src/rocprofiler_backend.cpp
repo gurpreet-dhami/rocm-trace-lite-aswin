@@ -213,9 +213,11 @@ int rtl_tool_init(rocprofiler_client_finalize_t, void*) {
         return -1;
     }
 
-    // Create buffer for async kernel dispatch records (8MB, flush at 4MB watermark)
+    // Create buffer for async kernel dispatch records.
+    // Watermark=4096: flush frequently to avoid data loss when workers are killed.
+    // SGLang/vLLM kill workers with SIGKILL — atexit handlers don't run.
     status = rocprofiler_create_buffer(
-        g_ctx, 8 * 1024 * 1024, 4 * 1024 * 1024,
+        g_ctx, 4 * 1024 * 1024, 4096,
         ROCPROFILER_BUFFER_POLICY_LOSSLESS,
         buffer_tracing_callback, nullptr, &g_buffer);
     if (status != ROCPROFILER_STATUS_SUCCESS) {

@@ -153,8 +153,11 @@ def run_trace(args):
         env["HSA_TOOLS_LIB"] = lib
 
     # LD_PRELOAD librtl.so for roctx shim symbol visibility.
-    existing_preload = env.get("LD_PRELOAD", "")
-    env["LD_PRELOAD"] = "{}:{}".format(lib, existing_preload) if existing_preload else lib
+    # For rocprofiler-sdk backend, skip LD_PRELOAD — ROCP_TOOL_LIBRARIES handles
+    # tool loading, and LD_PRELOAD can cause LLVM symbol conflicts on ROCm 10+.
+    if not rocp_backend:
+        existing_preload = env.get("LD_PRELOAD", "")
+        env["LD_PRELOAD"] = "{}:{}".format(lib, existing_preload) if existing_preload else lib
     if hasattr(args, 'mode') and args.mode:
         env["RTL_MODE"] = args.mode
 

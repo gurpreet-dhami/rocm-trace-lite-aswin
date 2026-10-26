@@ -25,7 +25,10 @@ SRCDIR = src
 # Backend-specific source and link flags
 ifeq ($(BACKEND),rocprofiler_sdk)
   BACKEND_SRC = rocprofiler_backend.cpp
-  LDFLAGS = $(LDFLAGS_COMMON) -lrocprofiler-sdk
+  # Don't link librocprofiler-sdk — symbols are resolved at runtime by
+  # rocprofiler-register (which already has them loaded). Avoids pulling
+  # libamd_comgr → libLLVM into our dep chain (LLVM conflict on ROCm 10).
+  LDFLAGS = $(LDFLAGS_COMMON)
   CXXFLAGS += -DRTL_BACKEND_ROCPROFILER_SDK
 else
   BACKEND_SRC = hsa_intercept.cpp

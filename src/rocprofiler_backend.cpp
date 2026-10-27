@@ -177,7 +177,14 @@ void shutdown() {
     bool expected = false;
     if (!g_shutdown_done.compare_exchange_strong(expected, true)) return;
 
-    rocprofiler_flush_buffer(g_buffer);
+    // Guard: rocprofiler may already be finalized (e.g. child process shutdown
+    // order). Calling rocprofiler_flush_buffer after finalization segfaults.
+    int finalized = 0;
+    if (rocprofiler_is_finalized(&finalized) == ROCPROFILER_STATUS_SUCCESS && finalized != 0) {
+        fprintf(stderr, "rtl: rocprofiler already finalized, skipping flush (pid=%d)\n", getpid());
+    } else {
+        rocprofiler_flush_buffer(g_buffer);
+    }
 
     fprintf(stderr, "rtl: recorded %" PRIu64 " kernel dispatches (pid=%d)\n",
             g_recorded.load(), getpid());

@@ -79,11 +79,10 @@ std::string demangle_kernel_name(const char* raw) {
     return name;
 }
 
-const std::string& resolve_kernel_name(uint64_t kernel_id) {
-    static const std::string unknown = "<unknown>";
+std::string resolve_kernel_name(uint64_t kernel_id) {
     std::lock_guard<std::mutex> lock(g_kernel_mutex);
     auto it = g_kernel_names.find(kernel_id);
-    return (it != g_kernel_names.end()) ? it->second : unknown;
+    return (it != g_kernel_names.end()) ? it->second : "<unknown>";
 }
 
 int resolve_device_id(uint64_t agent_handle) {
@@ -113,7 +112,7 @@ void buffer_tracing_callback(rocprofiler_context_id_t,
 
             const auto& info = record->dispatch_info;
             int device_id = resolve_device_id(info.agent_id.handle);
-            const std::string& kname = resolve_kernel_name(info.kernel_id);
+            std::string kname = resolve_kernel_name(info.kernel_id);
 
             char dispatch_info[128];
             snprintf(dispatch_info, sizeof(dispatch_info),

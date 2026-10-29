@@ -10,10 +10,15 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC_DIR = os.path.join(REPO_ROOT, "src")
 TOOLS_DIR = os.path.join(REPO_ROOT, "tools")
 
+# rocprofiler_backend.cpp is excluded — it intentionally uses rocprofiler-sdk headers
+ROCP_BACKEND_FILES = {"rocprofiler_backend.cpp"}
+
 SOURCE_FILES = []
 for f in os.listdir(SRC_DIR):
     if f.endswith((".cpp", ".h")):
         SOURCE_FILES.append(os.path.join(SRC_DIR, f))
+
+HSA_SOURCE_FILES = [f for f in SOURCE_FILES if os.path.basename(f) not in ROCP_BACKEND_FILES]
 
 
 class TestSourceGuard:
@@ -30,8 +35,8 @@ class TestSourceGuard:
             )
 
     def test_no_rocprofiler_sdk_includes(self):
-        """T1.2b — No #include of rocprofiler-sdk headers."""
-        for fpath in SOURCE_FILES:
+        """T1.2b — No #include of rocprofiler-sdk headers (HSA backend files only)."""
+        for fpath in HSA_SOURCE_FILES:
             with open(fpath) as f:
                 content = f.read()
             matches = re.findall(r'#include\s*[<"].*rocprofiler-sdk.*[>"]', content)
@@ -71,7 +76,7 @@ class TestSourceGuard:
         """Verify all expected files are present."""
         expected_src = ["trace_db.h", "trace_db.cpp", "hsa_intercept.cpp",
                         "roctx_shim.cpp", "hip_api_intercept.cpp",
-                        "hip_api_intercept.h"]
+                        "hip_api_intercept.h", "rocprofiler_backend.cpp"]
         expected_tools = ["rtl.sh", "rpd2trace.py"]
         expected_root = ["Makefile"]
 

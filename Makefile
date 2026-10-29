@@ -53,8 +53,8 @@ $(TARGET): $(OBJS)
 	$(CXX) -o $@ $^ $(LDFLAGS)
 	@echo "Built $(TARGET) [backend=$(BACKEND)]"
 ifeq ($(BACKEND),rocprofiler_sdk)
-	@echo "  Dependencies: librocprofiler-sdk, libsqlite3"
-	@ldd $@ | grep -E "roctracer|libamdhip64" && echo "ERROR: unwanted dependency!" && exit 1 || echo "  Verified: clean dependency chain"
+	@echo "  Dependencies: libsqlite3 (rocprofiler-sdk resolved at runtime via ROCP_TOOL_LIBRARIES)"
+	@ldd $@ | grep -E "roctracer|rocprofiler-sdk|libamdhip64|libamd_comgr" && echo "ERROR: unwanted dependency!" && exit 1 || echo "  Verified: clean dependency chain (no rocprofiler-sdk, no LLVM)"
 else
 	@echo "  Dependencies: libhsa-runtime64, libsqlite3"
 	@ldd $@ | grep -E "roctracer|rocprofiler-sdk|libamdhip64" && echo "ERROR: unwanted dependency!" && exit 1 || echo "  Verified: clean dependency chain (no roctracer, no rocprofiler-sdk, no libamdhip64)"

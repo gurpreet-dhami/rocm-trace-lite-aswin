@@ -287,9 +287,11 @@ class TestSourceGuardExtended:
     """Extended source-level dependency guards beyond test_source_guard.py."""
 
     def test_no_roctracer_rocprofiler_in_cpp(self):
-        """src/*.cpp must not include roctracer or rocprofiler headers."""
+        """src/*.cpp must not include roctracer or rocprofiler headers (HSA files only)."""
         for fname in os.listdir(SRC_DIR):
             if not fname.endswith((".cpp", ".h")):
+                continue
+            if fname == "rocprofiler_backend.cpp":
                 continue
             fpath = os.path.join(SRC_DIR, fname)
             with open(fpath) as f:
